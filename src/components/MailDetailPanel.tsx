@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { X, Sparkles, Mail, Send, BookOpen, CheckCircle2, AlertTriangle } from "lucide-react";
+import { X, Sparkles, Mail, Send, BookOpen, CheckCircle2, AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -18,16 +18,19 @@ type Props = {
   item: MailItem | null;
   onClose: () => void;
   onReassign: (messageId: string, newDeptId: string) => void;
+  onReplySent: (messageId: string) => void;
 };
 
-export function MailDetailPanel({ item, onClose, onReassign }: Props) {
+export function MailDetailPanel({ item, onClose, onReassign, onReplySent }: Props) {
   const [showReply, setShowReply] = useState(false);
   const [replyText, setReplyText] = useState("");
+  const [sending, setSending] = useState(false);
 
   useEffect(() => {
     if (item) {
       setShowReply(false);
       setReplyText(`${nameFromEmail(item.from_email)}님께,\n\n`);
+      setSending(false);
     }
   }, [item?.message_id]);
 
@@ -192,14 +195,44 @@ export function MailDetailPanel({ item, onClose, onReassign }: Props) {
                     취소
                   </button>
                   <Button
-                    disabled={!replyText.trim()}
+                    disabled={!replyText.trim() || sending}
                     className="bg-primary text-primary-foreground hover:bg-primary/90"
-                    onClick={() => {
-                      toast.info("데모 모드: 실제 메일은 발송되지 않습니다");
-                      setShowReply(false);
+                    onClick={async () => {
+                      if (!item) return;
+                      setSending(true);
+                      try {
+                        const res = await fetch(
+                          "https://zat8040.app.n8n.cloud/webhook/mailman-reply",
+                          {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              message_id: item.message_id,
+                              from_email: item.from_email,
+                              subject: item.subject,
+                              student_reply_body: replyText,
+                            }),
+                          },
+                        );
+                        const json = await res.json().catch(() => ({}));
+                        if (!res.ok || json?.ok !== true) throw new Error("send failed");
+                        toast.success("학생에게 답장을 보냈습니다");
+                        onReplySent(item.message_id);
+                        setShowReply(false);
+                      } catch (err) {
+                        console.error(err);
+                        toast.error("전송에 실패했습니다. 다시 시도해주세요");
+                        setSending(false);
+                      }
                     }}
                   >
-                    답장 보내기
+                    {sending ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" /> 전송 중...
+                      </span>
+                    ) : (
+                      "답장 보내기"
+                    )}
                   </Button>
                 </div>
               </div>

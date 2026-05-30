@@ -116,6 +116,17 @@ function Index() {
     setSelectedId(null);
   }
 
+  function markReplied(messageId: string) {
+    setItems((prev) =>
+      prev.map((i) =>
+        i.message_id === messageId ? { ...i, student_reply_sent: true } : i,
+      ),
+    );
+    setTimeout(() => {
+      refresh();
+    }, 1500);
+  }
+
   return (
     <div className="flex min-h-screen bg-background text-foreground">
       {/* Sidebar */}
@@ -344,6 +355,7 @@ function Index() {
         item={selected}
         onClose={() => setSelectedId(null)}
         onReassign={reassign}
+        onReplySent={markReplied}
       />
     </div>
   );
