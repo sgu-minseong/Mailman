@@ -1,0 +1,1364 @@
+{
+  "name": "Mailman_Email_Router_MVP_Gmail",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "-subject:\"[Mailman 자동배정]\" -subject:\"[Mailman 자동응답]\" -from:admin-mailbox@example.com"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "id": "53cf4269-5535-4057-bd1e-3e811178be4e",
+      "name": "Gmail Trigger Node",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -9936,
+        160
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const MAILMAN_CORE_EMAIL = \"mailman-core@example.com\";\nconst DEPARTMENT_MAILBOXES = {\n  admissions: { department_name: \"입학처\", department_email: \"admissions@example.com\" },\n  finance_team: { department_name: \"재무팀\", department_email: \"finance@example.com\" },\n  academic_records: { department_name: \"학적팀\", department_email: \"academic@example.com\" },\n  international_team: { department_name: \"국제팀\", department_email: \"international@example.com\" }\n};\n\nfunction readHeader(headers, name) {\n  const target = String(name || \"\").toLowerCase();\n  if (!headers) return \"\";\n\n  if (Array.isArray(headers)) {\n    const found = headers.find((header) => String(header.name || \"\").toLowerCase() === target);\n    return found ? String(found.value || \"\") : \"\";\n  }\n\n  const direct = headers[name] || headers[target];\n  if (direct) return String(direct);\n\n  const key = Object.keys(headers).find((headerName) => headerName.toLowerCase() === target);\n  return key ? String(headers[key] || \"\") : \"\";\n}\n\nfunction firstNonEmpty(values) {\n  for (const value of values) {\n    if (value === undefined || value === null) continue;\n    if (typeof value === \"object\") continue;\n    const text = String(value).trim();\n    if (text) return text;\n  }\n  return \"\";\n}\n\nconst EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi;\n\nfunction extractEmails(value) {\n  if (value === undefined || value === null) return [];\n\n  if (typeof value === \"object\") {\n    const objectCandidates = [value.email, value.address, value.value, value.text, value.to, value.cc, value.from];\n    const found = [];\n    for (const candidate of objectCandidates) {\n      found.push(...extractEmails(candidate));\n    }\n\n    try {\n      found.push(...extractEmails(JSON.stringify(value)));\n    } catch (error) {}\n\n    return [...new Set(found.map((email) => email.toLowerCase()))];\n  }\n\n  const text = String(value || \"\");\n  const matches = text.match(EMAIL_PATTERN) || [];\n  return [...new Set(matches.map((email) => email.toLowerCase()))];\n}\n\nfunction extractEmail(value) {\n  return extractEmails(value)[0] || \"\";\n}\n\nfunction normalizeFromEmail(values) {\n  for (const value of values) {\n    const email = extractEmail(value);\n    if (email) return email;\n  }\n  return \"unknown_sender\";\n}\n\nfunction normalizeDate(value) {\n  if (value === undefined || value === null || value === \"\") {\n    return { received_at_utc: \"\", received_at_kst: \"\", received_at: \"\" };\n  }\n\n  let date;\n  if (typeof value === \"number\" || /^\\d+$/.test(String(value))) {\n    const numeric = Number(value);\n    date = new Date(numeric > 9999999999 ? numeric : numeric * 1000);\n  } else {\n    date = new Date(value);\n  }\n\n  if (Number.isNaN(date.getTime())) {\n    return { received_at_utc: \"\", received_at_kst: \"\", received_at: \"\" };\n  }\n\n  const received_at_utc = date.toISOString();\n  const kstDate = new Date(date.getTime() + 9 * 60 * 60 * 1000);\n  const pad = (number) => String(number).padStart(2, \"0\");\n  const received_at_kst = kstDate.getUTCFullYear() + \"-\" + pad(kstDate.getUTCMonth() + 1) + \"-\" + pad(kstDate.getUTCDate()) + \" \" + pad(kstDate.getUTCHours()) + \":\" + pad(kstDate.getUTCMinutes()) + \":\" + pad(kstDate.getUTCSeconds()) + \" KST\";\n\n  return { received_at_utc, received_at_kst, received_at: received_at_kst };\n}\n\nfunction decodeBase64Url(value) {\n  if (!value || typeof Buffer === \"undefined\") return \"\";\n  try {\n    const normalized = String(value).replace(/-/g, \"+\").replace(/_/g, \"/\");\n    return Buffer.from(normalized, \"base64\").toString(\"utf8\");\n  } catch (error) {\n    return \"\";\n  }\n}\n\nfunction collectPartBodies(parts) {\n  if (!Array.isArray(parts)) return [];\n\n  const bodies = [];\n  for (const part of parts) {\n    if (!part) continue;\n    const mimeType = String(part.mimeType || \"\").toLowerCase();\n    const data = part.body && part.body.data ? decodeBase64Url(part.body.data) : \"\";\n\n    if (data && (mimeType.includes(\"text/plain\") || mimeType.includes(\"text/html\"))) {\n      bodies.push(data);\n    }\n\n    bodies.push(...collectPartBodies(part.parts));\n  }\n\n  return bodies;\n}\n\nfunction stripHtml(value) {\n  return String(value || \"\")\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, \" \")\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, \" \")\n    .replace(/<[^>]+>/g, \" \")\n    .replace(/&nbsp;/g, \" \")\n    .replace(/&amp;/g, \"&\")\n    .replace(/&lt;/g, \"<\")\n    .replace(/&gt;/g, \">\")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\nfunction bodyValue(value, source) {\n  if (value === undefined || value === null || value === false) return { text: \"\", source: \"\" };\n  if (typeof value === \"string\" || typeof value === \"number\" || typeof value === \"boolean\") {\n    const text = String(value).trim();\n    return text ? { text, source } : { text: \"\", source: \"\" };\n  }\n  if (typeof value !== \"object\") return { text: \"\", source: \"\" };\n\n  const candidates = [\n    [\"textPlain\", value.textPlain],\n    [\"plainText\", value.plainText],\n    [\"text\", value.text],\n    [\"body\", value.body],\n    [\"content\", value.content],\n    [\"data\", value.data],\n    [\"textHtml\", value.textHtml],\n    [\"html\", value.html],\n    [\"snippet\", value.snippet]\n  ];\n\n  for (const candidate of candidates) {\n    const nested = bodyValue(candidate[1], source + \".\" + candidate[0]);\n    if (nested.text) return nested;\n  }\n  return { text: \"\", source: \"\" };\n}\n\nfunction collectPartBodyCandidates(parts, prefix) {\n  if (!Array.isArray(parts)) return [];\n\n  const candidates = [];\n  parts.forEach((part, index) => {\n    if (!part) return;\n    const path = prefix + \"[\" + index + \"]\";\n    const mimeType = String(part.mimeType || \"\").toLowerCase();\n    const dataText = part.body && part.body.data ? decodeBase64Url(part.body.data) : \"\";\n    if (dataText && mimeType.includes(\"text/plain\")) candidates.push({ text: dataText, source: path + \".text/plain\" });\n    if (dataText && mimeType.includes(\"text/html\")) candidates.push({ text: dataText, source: path + \".text/html\" });\n    candidates.push(...collectPartBodyCandidates(part.parts, path + \".parts\"));\n  });\n  return candidates;\n}\n\nfunction normalizeBody(json, payload) {\n  const partCandidates = [\n    ...collectPartBodyCandidates(payload.parts, \"payload.parts\"),\n    ...collectPartBodyCandidates(json.message && json.message.payload && json.message.payload.parts, \"message.payload.parts\"),\n    ...collectPartBodyCandidates(json.data && json.data.payload && json.data.payload.parts, \"data.payload.parts\")\n  ];\n  const partPlain = partCandidates.find((candidate) => candidate.source.includes(\"text/plain\")) || { text: \"\", source: \"\" };\n  const partHtml = partCandidates.find((candidate) => candidate.source.includes(\"text/html\")) || { text: \"\", source: \"\" };\n  const payloadBody = payload.body && payload.body.data ? { text: decodeBase64Url(payload.body.data), source: \"payload.body.data\" } : { text: \"\", source: \"\" };\n\n  const candidates = [\n    bodyValue(json.textPlain, \"json.textPlain\"),\n    bodyValue(json.text, \"json.text\"),\n    bodyValue(json.plainText, \"json.plainText\"),\n    partPlain,\n    bodyValue(json.body, \"json.body\"),\n    payloadBody,\n    bodyValue(json.textHtml, \"json.textHtml\"),\n    bodyValue(json.html === false ? \"\" : json.html, \"json.html\"),\n    partHtml,\n    bodyValue(json.snippet, \"json.snippet\")\n  ];\n\n  const selected = candidates.find((candidate) => candidate && String(candidate.text || \"\").trim()) || { text: \"\", source: \"not_found\" };\n  normalizeBody.lastDebug = {\n    source: selected.source,\n    length: String(selected.text || \"\").length,\n    checked_sources: candidates.map((candidate) => candidate.source).filter(Boolean),\n    json_html_is_false: json.html === false\n  };\n  return stripHtml(selected.text);\n}\n\nfunction collectAttachmentParts(parts) {\n  if (!Array.isArray(parts)) return [];\n\n  const attachments = [];\n  for (const part of parts) {\n    if (!part) continue;\n    if (part.filename) attachments.push(part);\n    attachments.push(...collectAttachmentParts(part.parts));\n  }\n  return attachments;\n}\n\nfunction normalizeExistingAttachments(value) {\n  if (!Array.isArray(value)) return [];\n  return value\n    .filter((attachment) => attachment && (attachment.filename || attachment.fileName || attachment.name || attachment.attachment_id || attachment.attachmentId))\n    .map((attachment) => ({\n      filename: attachment.filename || attachment.fileName || attachment.name || \"\",\n      mime_type: attachment.mime_type || attachment.mimeType || attachment.contentType || \"\",\n      binary_property: attachment.binary_property || attachment.binaryProperty || attachment.binaryPropertyName || \"\",\n      attachment_id: attachment.attachment_id || attachment.attachmentId || attachment.id || \"\"\n    }));\n}\n\nfunction normalizeAttachments(item, payload) {\n  const binary = item.binary || {};\n  const binaryAttachments = Object.keys(binary).map((key) => ({\n    filename: binary[key].fileName || key,\n    mime_type: binary[key].mimeType || \"\",\n    binary_property: key\n  }));\n\n  if (binaryAttachments.length > 0) return binaryAttachments;\n\n  const existingAttachments = normalizeExistingAttachments((item.json || {}).attachments);\n  if (existingAttachments.length > 0) return existingAttachments;\n\n  return collectAttachmentParts([payload])\n    .map((part) => ({\n      filename: part.filename || \"\",\n      mime_type: part.mimeType || \"\",\n      attachment_id: part.body && part.body.attachmentId ? part.body.attachmentId : \"\"\n    }));\n}\n\nfunction departmentByEmail(email) {\n  const normalized = String(email || \"\").toLowerCase();\n  return Object.keys(DEPARTMENT_MAILBOXES).find((departmentId) => DEPARTMENT_MAILBOXES[departmentId].department_email.toLowerCase() === normalized) || \"\";\n}\n\nfunction inferDepartmentIntake(headers, json, subject, body) {\n  const routingTextValues = [\n    json.to,\n    json.cc,\n    json.deliveredTo,\n    json.xForwardedTo,\n    readHeader(headers, \"To\"),\n    readHeader(headers, \"Cc\"),\n    readHeader(headers, \"Delivered-To\"),\n    readHeader(headers, \"X-Original-To\"),\n    readHeader(headers, \"X-Forwarded-To\"),\n    readHeader(headers, \"X-Forwarded-For\")\n  ];\n  const routingEmails = [...new Set(routingTextValues.flatMap((value) => extractEmails(value)))];\n  const sourceDepartmentId = routingEmails.map(departmentByEmail).find(Boolean) || \"\";\n  const sourceDepartment = sourceDepartmentId ? DEPARTMENT_MAILBOXES[sourceDepartmentId] : null;\n  const coreWasRecipient = routingEmails.includes(MAILMAN_CORE_EMAIL.toLowerCase());\n  const signalText = [subject, body, ...routingTextValues].join(\" \").toLowerCase();\n  const forwardedHint = signalText.includes(\"forwarded message\") || signalText.includes(\"전달된 메시지\") || Boolean(sourceDepartmentId);\n\n  return {\n    core_email: MAILMAN_CORE_EMAIL,\n    source_mailbox: sourceDepartmentId || \"core_credential_mailbox\",\n    intake_channel: sourceDepartmentId ? \"forwarded_from_department\" : \"direct_to_core\",\n    is_forwarded_to_core: Boolean(sourceDepartmentId || forwardedHint),\n    original_recipient_department_id: sourceDepartmentId,\n    original_recipient_department_name: sourceDepartment ? sourceDepartment.department_name : \"\",\n    original_recipient_email: sourceDepartment ? sourceDepartment.department_email : \"\",\n    core_was_recipient: coreWasRecipient,\n    intake_detected_emails: routingEmails\n  };\n}\n\nfunction isMailmanGeneratedSubject(subject) {\n  const text = String(subject || \"\");\n  return text.includes(\"[Mailman 자동배정]\") || text.includes(\"[Mailman 자동응답]\");\n}\n\nreturn items.map((item) => {\n  const json = item.json || {};\n  const payload = json.payload || {};\n  const headers = payload.headers || json.headers || [];\n  const rawSubject = firstNonEmpty([json.subject, readHeader(headers, \"Subject\")]);\n  const subject = rawSubject || \"(no subject)\";\n\n  if (isMailmanGeneratedSubject(subject)) {\n    return null;\n  }\n\n  const receivedAtRaw = firstNonEmpty([json.date, json.received_at, readHeader(headers, \"Date\"), json.internalDate]);\n  const receivedAt = normalizeDate(receivedAtRaw);\n  const messageId = firstNonEmpty([json.id, json.messageId, json.message_id, readHeader(headers, \"Message-ID\")]);\n  const body = normalizeBody(json, payload);\n  const bodyDebug = normalizeBody.lastDebug || { source: \"not_found\", length: 0, checked_sources: [], json_html_is_false: json.html === false };\n  const fromEmail = normalizeFromEmail([json.from, json.sender, json.replyTo, readHeader(headers, \"From\"), readHeader(headers, \"Reply-To\")]);\n  const intake = inferDepartmentIntake(headers, json, subject, body);\n\n  if (!messageId && !json.id && !json.messageId && !json.threadId && !rawSubject && !body) {\n    return null;\n  }\n\n  return {\n    json: {\n      message_id: messageId,\n      from_email: fromEmail,\n      subject,\n      body,\n      body_debug: bodyDebug,\n      received_at: receivedAt.received_at,\n      received_at_utc: receivedAt.received_at_utc,\n      received_at_kst: receivedAt.received_at_kst,\n      attachments: normalizeAttachments(item, payload),\n      department_mailboxes: DEPARTMENT_MAILBOXES,\n      ...intake\n    },\n    binary: item.binary || {}\n  };\n}).filter(Boolean);"
+      },
+      "id": "7288e4f2-e7f8-42ba-9ad3-6a9344fd3df4",
+      "name": "Normalize Gmail Email Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -9696,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "demo-use-mock",
+              "name": "use_mock",
+              "value": false,
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "932a2cfe-32a2-43a3-af7b-9571b49e850b",
+      "name": "Demo Config Set Node",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -9456,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "use-mock-mode",
+              "leftValue": "={{ $json.use_mock }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f6d949bd-f91f-44fc-be4e-58a7b5b9b9a8",
+      "name": "Check USE_MOCK Mode IF Node",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -9216,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  item.json.classify_and_draft = {\n    status: 'gmail_trigger_normalized',\n    department_id: 'mock_department',\n    department_name: 'Mock 검토 부서',\n    confidence: 0.9,\n    reason: 'Step 11-1에서는 Gmail Trigger 데이터 정규화만 확인하므로 mock classification response를 사용함',\n    auto_reply: false,\n    manual_review: false,\n    draft_reply: 'Gmail Trigger 수신 및 정규화 테스트가 완료되었습니다. 실제 답변 초안은 다음 Step의 Upstage API 연결 후 생성합니다.',\n    routing_summary: 'Gmail Trigger로 들어온 실제 메일을 표준 구조로 변환하는 데모 경로입니다.'\n  };\n  return item;\n});"
+      },
+      "id": "1d9025a6-9362-45db-aa52-d1b243df4bda",
+      "name": "Mock Classification Response Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -8960,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "has-attachments",
+              "leftValue": "={{ Array.isArray($json.attachments) && $json.attachments.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7e99c94e-8f77-45dc-8a45-f596a702bc8f",
+      "name": "Check Attachment Exists IF Node",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -8960,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  const email = item.json || {};\n  const attachments = Array.isArray(email.attachments) ? email.attachments : [];\n  const firstAttachment = attachments[0] || {};\n  const binaryProperty = firstAttachment.binary_property || '';\n  const hasBinary = Boolean(binaryProperty && item.binary && item.binary[binaryProperty]);\n  const hasAttachmentIdOnly = Boolean(!hasBinary && firstAttachment.attachment_id);\n\n  item.json.document_parse_input = {\n    attachment_count: attachments.length,\n    selected_attachment: firstAttachment,\n    binary_property: binaryProperty,\n    has_binary: hasBinary,\n    has_attachment_id_only: hasAttachmentIdOnly,\n    todo: hasAttachmentIdOnly ? 'Gmail attachment fetch is required before Document Parse because only attachment_id is available.' : ''\n  };\n\n  if (!hasBinary) {\n    item.json.document_parse_status = 'skipped_or_failed';\n    item.json.document_text = '';\n    item.json.document_summary = '';\n    item.json.parsed_attachments = [];\n    item.json.document_parse_error = hasAttachmentIdOnly\n      ? 'Gmail attachment fetch required before binary upload to Upstage Document Parse.'\n      : 'No n8n binary data found for selected attachment.';\n    item.json.manual_review = false;\n  }\n\n  return item;\n});"
+      },
+      "id": "9b4c4017-7c1d-4f72-bdff-692dbc391dc9",
+      "name": "Prepare Document Parse Input Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -8704,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upstage.ai/v1/document-ai/document-parse",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "document",
+              "inputDataFieldName": "={{ $json.document_parse_input.binary_property || 'data' }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "6b71e974-433d-4071-bc0b-296018f8ecf9",
+      "name": "Upstage Document Parse HTTP Request Node",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -8448,
+        208
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ZTlGZrexjsva53YF",
+          "name": "Upstage API Key"
+        }
+      },
+      "continueOnFail": true,
+      "notes": "TODO: Confirm endpoint, method, binary file field name, multipart body, and response format in Upstage Console API Reference before production use. API key must be stored in n8n credential only."
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  const json = item.json || {};\n  const response = json.document_parse_api_response || json;\n  const hadPreparedFailure = json.document_parse_status === 'skipped_or_failed';\n  const httpError = response.error || response.message === 'Authorization failed' || response.statusCode >= 400;\n\n  if (hadPreparedFailure || httpError) {\n    item.json.document_parse_status = 'skipped_or_failed';\n    item.json.document_text = '';\n    item.json.document_summary = '';\n    item.json.parsed_attachments = [];\n    item.json.document_parse_error = json.document_parse_error || (response.error && (response.error.message || JSON.stringify(response.error))) || response.message || 'Document Parse API request failed.';\n    item.json.manual_review = false;\n    return item;\n  }\n\n  function stringifyText(value) {\n    if (value === undefined || value === null || value === false) return '';\n    if (typeof value === 'string') return value;\n    if (typeof value === 'number' || typeof value === 'boolean') return String(value);\n    if (Array.isArray(value)) return value.map(stringifyText).filter(Boolean).join('\\n');\n    if (typeof value === 'object') {\n      const nested = [value.text, value.markdown, value.html, value.content, value.value, value.description]\n        .map(stringifyText)\n        .filter(Boolean);\n      if (nested.length > 0) return nested.join('\\n');\n      return '';\n    }\n    return '';\n  }\n\n  const textCandidates = [\n    response.text,\n    response.content && response.content.text,\n    response.content && response.content.markdown,\n    response.content && response.content.html,\n    response.content,\n    response.markdown,\n    response.html,\n    response.document_text,\n    response.parsed_text,\n    response.result && response.result.text,\n    response.result && response.result.content,\n    response.pages,\n    response.elements\n  ].map(stringifyText).filter(Boolean);\n\n  const documentText = textCandidates.length > 0 ? textCandidates[0] : JSON.stringify(response);\n  const selectedAttachment = json.document_parse_input && json.document_parse_input.selected_attachment ? json.document_parse_input.selected_attachment : {};\n\n  item.json.document_parse_status = 'success';\n  item.json.document_text = documentText;\n  item.json.document_summary = documentText.slice(0, 500);\n  item.json.parsed_attachments = [\n    {\n      filename: selectedAttachment.filename || '',\n      mime_type: selectedAttachment.mime_type || '',\n      parse_status: 'success'\n    }\n  ];\n  item.json.document_parse_error = '';\n\n  return item;\n});"
+      },
+      "id": "6b91f32c-423a-4c66-b7b0-67ee02be188d",
+      "name": "Normalize Document Parse Result Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -8176,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  item.json.document_parse_status = 'skipped_or_failed';\n  item.json.document_text = '';\n  item.json.document_summary = '';\n  item.json.parsed_attachments = [];\n  item.json.document_parse_error = Array.isArray(item.json.attachments) && item.json.attachments.length > 0\n    ? 'Document Parse skipped or failed before API request.'\n    : 'No attachments found. Document Parse skipped.';\n  return item;\n});"
+      },
+      "id": "2d5bdc9f-b197-4175-b4a7-75066f4128a4",
+      "name": "Document Parse Fallback Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -8704,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const VIRTUAL_DEPARTMENT_EMAILS = {\n  admissions: 'admissions-demo@example.com',\n  finance_team: 'finance-demo@example.com',\n  academic_records: 'records-demo@example.com',\n  international_team: 'international-demo@example.com'\n};\n\nconst DEPARTMENT_NAMES = {\n  admissions: '입학처',\n  finance_team: '재무팀',\n  academic_records: '학적팀',\n  international_team: '국제팀'\n};\n\nfunction stringify(value) {\n  if (value === undefined || value === null) return '';\n  if (typeof value === 'string') return value;\n  try {\n    return JSON.stringify(value);\n  } catch (error) {\n    return String(value);\n  }\n}\n\nfunction inferSourceMailbox(email) {\n  if (email.source_mailbox) return email.source_mailbox;\n  if (email.original_recipient_department_id) return email.original_recipient_department_id;\n\n  const text = [\n    email.subject,\n    email.body,\n    email.from_email,\n    email.original_recipient_email,\n    stringify(email.intake_detected_emails),\n    stringify(email.attachments)\n  ].join(' ').toLowerCase();\n\n  for (const departmentId of Object.keys(VIRTUAL_DEPARTMENT_EMAILS)) {\n    if (text.includes(VIRTUAL_DEPARTMENT_EMAILS[departmentId].toLowerCase())) {\n      return departmentId;\n    }\n  }\n\n  return 'core_credential_mailbox';\n}\n\nfunction inferIntakeChannel(sourceMailbox, email) {\n  if (email.intake_channel) return email.intake_channel;\n  if (!sourceMailbox || sourceMailbox === 'core_credential_mailbox') return 'direct_to_core';\n  return 'forwarded_from_department';\n}\n\nreturn items.map((item) => {\n  const email = item.json || {};\n  const sourceMailbox = inferSourceMailbox(email);\n  const intakeChannel = inferIntakeChannel(sourceMailbox, email);\n  const isForwardedToCore = email.is_forwarded_to_core === true || intakeChannel === 'forwarded_from_department';\n  const originalRecipientDepartmentId = email.original_recipient_department_id || (sourceMailbox !== 'core_credential_mailbox' ? sourceMailbox : '');\n  const originalRecipientDepartmentName = email.original_recipient_department_name || DEPARTMENT_NAMES[originalRecipientDepartmentId] || '';\n  const originalRecipientEmail = email.original_recipient_email || VIRTUAL_DEPARTMENT_EMAILS[originalRecipientDepartmentId] || '';\n\n  const originalEmailContext = {\n    message_id: email.message_id || '',\n    from_email: email.from_email || '',\n    subject: email.subject || '',\n    body: email.body || '',\n    received_at: email.received_at || '',\n    received_at_utc: email.received_at_utc || '',\n    received_at_kst: email.received_at_kst || '',\n    attachments: Array.isArray(email.attachments) ? email.attachments : [],\n    source_mailbox: sourceMailbox,\n    intake_channel: intakeChannel,\n    is_forwarded_to_core: isForwardedToCore,\n    original_recipient_department_id: originalRecipientDepartmentId,\n    original_recipient_department_name: originalRecipientDepartmentName,\n    original_recipient_email: originalRecipientEmail,\n    core_email: email.core_email || 'mailman-core-demo@example.com',\n    document_parse_status: email.document_parse_status || '',\n    document_text: email.document_text || '',\n    document_summary: email.document_summary || '',\n    parsed_attachments: Array.isArray(email.parsed_attachments) ? email.parsed_attachments : [],\n    document_parse_error: email.document_parse_error || ''\n  };\n\n  const extractionInput = {\n    core_context: 'This email was received by the Mailman Core mailbox. It may have been sent directly to Core or automatically forwarded from a department mailbox.',\n    ...originalEmailContext,\n    virtual_department_emails: VIRTUAL_DEPARTMENT_EMAILS,\n    extraction_schema: {\n      student_name: '',\n      student_id: '',\n      department: '',\n      grade: '',\n      inquiry_type: '',\n      document_type: '',\n      request_summary: '',\n      requested_action: '',\n      confidence: 0.0\n    }\n  };\n\n  item.json = {\n    ...email,\n    ...originalEmailContext,\n    source_mailbox: sourceMailbox,\n    intake_channel: intakeChannel,\n    is_forwarded_to_core: isForwardedToCore,\n    original_recipient_department_id: originalRecipientDepartmentId,\n    original_recipient_department_name: originalRecipientDepartmentName,\n    original_recipient_email: originalRecipientEmail,\n    virtual_department_emails: VIRTUAL_DEPARTMENT_EMAILS,\n    original_email_context: originalEmailContext,\n    extraction_input: extractionInput,\n    information_extract_request: {\n      schema_source: 'prompts/extraction_schema.json',\n      input_text: [\n        'Subject: ' + extractionInput.subject,\n        'Body: ' + extractionInput.body,\n        'Document Parse Status: ' + extractionInput.document_parse_status,\n        'Document Summary: ' + extractionInput.document_summary,\n        'Document Text: ' + extractionInput.document_text,\n        'Source Mailbox: ' + extractionInput.source_mailbox,\n        'Intake Channel: ' + extractionInput.intake_channel,\n        'Original Recipient Department: ' + extractionInput.original_recipient_department_name,\n        'Original Recipient Email: ' + extractionInput.original_recipient_email\n      ].join('\\n\\n'),\n      schema: extractionInput.extraction_schema,\n      todo: 'Confirm Upstage Information Extract endpoint, method, schema field name, input text field name, and response format in official API Reference.'\n    }\n  };\n\n  return item;\n});"
+      },
+      "id": "eaf417b7-4db1-43a9-8e7b-630052cffb67",
+      "name": "Prepare Information Extract Input Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -7920,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upstage.ai/v1/information-extraction",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { input_text: $json.information_extract_request.input_text, schema: $json.information_extract_request.schema } }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "3a943e25-2620-40a0-b722-2afa58fa97fc",
+      "name": "Upstage Information Extract HTTP Request Node",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -7664,
+        288
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ZTlGZrexjsva53YF",
+          "name": "Upstage API Key"
+        }
+      },
+      "continueOnFail": true,
+      "notes": "TODO: Confirm endpoint, method, schema field name, input text field name, request body, and response format in Upstage Console API Reference. API key must be stored in n8n credential only."
+    },
+    {
+      "parameters": {
+        "functionCode": "function pickPayload(response) {\n  if (!response || typeof response !== 'object') return {};\n  return response.extracted || response.result || response.data || response.output || response;\n}\n\nfunction asNumber(value) {\n  const number = Number(value);\n  return Number.isFinite(number) ? number : 0;\n}\n\nfunction arrayOrEmpty(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nfunction upstreamJson(index) {\n  try {\n    if (typeof $items === 'function') {\n      const upstream = $items('Prepare Information Extract Input Function Node', 0, 0) || [];\n      return (upstream[index] && upstream[index].json) || {};\n    }\n  } catch (error) {}\n  try {\n    if (typeof $node !== 'undefined' && $node['Prepare Information Extract Input Function Node'] && $node['Prepare Information Extract Input Function Node'].json) {\n      return $node['Prepare Information Extract Input Function Node'].json;\n    }\n  } catch (error) {}\n  return {};\n}\n\nfunction restoreOriginalFields(json, index) {\n  const upstream = upstreamJson(index);\n  const original = json.original_email_context || json.extraction_input || upstream.original_email_context || upstream.extraction_input || upstream || {};\n  return {\n    message_id: json.message_id || original.message_id || '',\n    from_email: json.from_email || original.from_email || '',\n    subject: json.subject || original.subject || '',\n    body: json.body || original.body || '',\n    received_at: json.received_at || original.received_at || '',\n    received_at_utc: json.received_at_utc || original.received_at_utc || '',\n    received_at_kst: json.received_at_kst || original.received_at_kst || '',\n    attachments: Array.isArray(json.attachments) ? json.attachments : arrayOrEmpty(original.attachments),\n    source_mailbox: json.source_mailbox || original.source_mailbox || 'core_credential_mailbox',\n    intake_channel: json.intake_channel || original.intake_channel || 'unknown',\n    is_forwarded_to_core: json.is_forwarded_to_core === true || original.is_forwarded_to_core === true,\n    document_parse_status: json.document_parse_status || original.document_parse_status || '',\n    document_text: json.document_text || original.document_text || '',\n    document_summary: json.document_summary || original.document_summary || '',\n    parsed_attachments: Array.isArray(json.parsed_attachments) ? json.parsed_attachments : arrayOrEmpty(original.parsed_attachments),\n    document_parse_error: json.document_parse_error || original.document_parse_error || ''\n  };\n}\n\nreturn items.map((item, index) => {\n  const json = item.json || {};\n  const upstream = upstreamJson(index);\n  const originalFields = restoreOriginalFields(json, index);\n  const originalEmailContext = json.original_email_context || upstream.original_email_context || originalFields;\n  const response = json.information_extract_api_response || json;\n  const httpError = response.error || response.statusCode >= 400;\n  const payload = pickPayload(response);\n  const hasRequiredShape = payload && typeof payload === 'object';\n  const baseOutput = {\n    ...originalEmailContext,\n    ...originalFields,\n    original_email_context: originalEmailContext,\n    extraction_input: json.extraction_input || upstream.extraction_input || originalEmailContext,\n    information_extract_api_response: response,\n    virtual_department_emails: json.virtual_department_emails || upstream.virtual_department_emails\n  };\n\n  if (httpError || !hasRequiredShape) {\n    item.json = {\n      ...baseOutput,\n      information_extract_status: 'failed',\n      extracted_student_info: {},\n      extracted_request_info: {},\n      information_extract_error: (response.error && (response.error.message || JSON.stringify(response.error))) || response.message || 'Information Extract API request failed or returned invalid output.',\n      manual_review: false\n    };\n    return item;\n  }\n\n  item.json = {\n    ...baseOutput,\n    information_extract_status: 'success',\n    extracted_student_info: {\n      student_name: String(payload.student_name || ''),\n      student_id: String(payload.student_id || ''),\n      department: String(payload.department || ''),\n      grade: String(payload.grade || '')\n    },\n    extracted_request_info: {\n      inquiry_type: String(payload.inquiry_type || ''),\n      document_type: String(payload.document_type || ''),\n      request_summary: String(payload.request_summary || ''),\n      requested_action: String(payload.requested_action || ''),\n      confidence: asNumber(payload.confidence)\n    },\n    information_extract_error: ''\n  };\n\n  return item;\n});"
+      },
+      "id": "21449968-7c9e-4554-a75f-fe79433c5409",
+      "name": "Normalize Information Extract Result Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -7408,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "function arrayOrEmpty(value) {\n  return Array.isArray(value) ? value : [];\n}\n\nfunction preserveOriginalFields(json) {\n  const original = json.original_email_context || json.extraction_input || {};\n  return {\n    message_id: json.message_id || original.message_id || '',\n    from_email: json.from_email || original.from_email || '',\n    subject: json.subject || original.subject || '',\n    body: json.body || original.body || '',\n    received_at: json.received_at || original.received_at || '',\n    received_at_utc: json.received_at_utc || original.received_at_utc || '',\n    received_at_kst: json.received_at_kst || original.received_at_kst || '',\n    attachments: Array.isArray(json.attachments) ? json.attachments : arrayOrEmpty(original.attachments),\n    source_mailbox: json.source_mailbox || original.source_mailbox || 'core_credential_mailbox',\n    intake_channel: json.intake_channel || original.intake_channel || 'unknown',\n    is_forwarded_to_core: json.is_forwarded_to_core === true || original.is_forwarded_to_core === true,\n    document_parse_status: json.document_parse_status || original.document_parse_status || '',\n    document_text: json.document_text || original.document_text || '',\n    document_summary: json.document_summary || original.document_summary || '',\n    parsed_attachments: Array.isArray(json.parsed_attachments) ? json.parsed_attachments : arrayOrEmpty(original.parsed_attachments),\n    document_parse_error: json.document_parse_error || original.document_parse_error || ''\n  };\n}\n\nreturn items.map((item) => {\n  const json = item.json || {};\n  const preserved = preserveOriginalFields(json);\n  json.original_email_context = json.original_email_context || preserved;\n  Object.assign(json, preserved);\n\n  if (json.information_extract_status === 'success') {\n    json.extracted_student_info = json.extracted_student_info || {};\n    json.extracted_request_info = json.extracted_request_info || {};\n    json.information_extract_error = json.information_extract_error || '';\n    return item;\n  }\n\n  json.information_extract_status = 'failed';\n  json.extracted_student_info = json.extracted_student_info || {};\n  json.extracted_request_info = json.extracted_request_info || {};\n  json.information_extract_error = json.information_extract_error || 'Information Extract skipped, failed, or returned invalid output.';\n  json.manual_review = false;\n  return item;\n});"
+      },
+      "id": "e1dc32e0-60a9-46f4-a936-2dbaa3874a8f",
+      "name": "Information Extract Fallback Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -7408,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const DEPARTMENT_EMAILS = {\n  admissions: { department_name: '\\uC785\\uD559\\uCC98', department_email: 'admissions-demo@example.com' },\n  finance_team: { department_name: '\\uC7AC\\uBB34\\uD300', department_email: 'finance-demo@example.com' },\n  academic_records: { department_name: '\\uD559\\uC801\\uD300', department_email: 'records-demo@example.com' },\n  international_team: { department_name: '\\uAD6D\\uC81C\\uD300', department_email: 'international-demo@example.com' }\n};\n\nconst LEGACY_DEPARTMENT_ALIASES = {\n  academic_affairs: 'academic_records',\n  scholarship_team: 'finance_team',\n  dormitory_team: 'academic_records'\n};\n\nfunction includesAny(text, keywords) {\n  return keywords.some((keyword) => text.includes(keyword.toLowerCase()));\n}\n\nfunction inferDepartment(text) {\n  const t = String(text || '').toLowerCase();\n  if (includesAny(t, ['\\uAD6D\\uC81C', '\\uC720\\uD559\\uC0DD', '\\uBE44\\uC790', '\\uAD50\\uD658\\uD559\\uC0DD', '\\uD574\\uC678', 'international', 'visa', 'exchange student'])) return 'international_team';\n  if (includesAny(t, ['\\uC785\\uD559', '\\uC6D0\\uC11C', '\\uC9C0\\uC6D0', 'admission', 'application'])) return 'admissions';\n  if (includesAny(t, ['\\uB4F1\\uB85D\\uAE08', '\\uB0A9\\uBD80', '\\uD658\\uBD88', '\\uACB0\\uC81C', 'tuition', 'payment', 'refund'])) return 'finance_team';\n  if (includesAny(t, ['\\uD559\\uC801', '\\uC131\\uC801\\uD45C', '\\uC99D\\uBA85\\uC11C', '\\uC878\\uC5C5', '\\uD734\\uD559', '\\uBCF5\\uD559', 'transcript', 'certificate', 'graduation'])) return 'academic_records';\n  if (includesAny(t, ['\\uC7A5\\uD559\\uAE08', 'scholarship'])) return 'finance_team';\n  if (includesAny(t, ['\\uAE30\\uC219\\uC0AC', 'dormitory'])) return 'academic_records';\n  if (includesAny(t, ['\\uC218\\uAC15\\uC2E0\\uCCAD', '\\uD559\\uC0AC\\uC77C\\uC815', 'course registration', 'class schedule'])) return 'academic_records';\n  return 'academic_records';\n}\n\nfunction normalizeDepartmentId(value, text) {\n  const raw = String(value || '').trim();\n  if (DEPARTMENT_EMAILS[raw]) return raw;\n  if (LEGACY_DEPARTMENT_ALIASES[raw]) return LEGACY_DEPARTMENT_ALIASES[raw];\n  return inferDepartment(text);\n}\n\nfunction applyDepartmentFields(target, departmentId) {\n  const safeId = DEPARTMENT_EMAILS[departmentId] ? departmentId : 'academic_records';\n  const dept = DEPARTMENT_EMAILS[safeId];\n  target.department_id = safeId;\n  target.department_name = dept.department_name;\n  target.department_email = dept.department_email;\n  return safeId;\n}\n\nfunction deptList() {\n  return Object.keys(DEPARTMENT_EMAILS)\n    .map((id) => '  - ' + id + ' (' + DEPARTMENT_EMAILS[id].department_name + ', ' + DEPARTMENT_EMAILS[id].department_email + ')')\n    .join('\\n');\n}\n\nreturn items.map((item) => {\n  const email = item.json || {};\n  const original = email.original_email_context || {};\n  const actualGmailInput = {\n    message_id: email.message_id || original.message_id || '',\n    from_email: email.from_email || original.from_email || '',\n    subject: email.subject || original.subject || '',\n    body: email.body || original.body || '',\n    received_at: email.received_at || original.received_at || '',\n    received_at_utc: email.received_at_utc || original.received_at_utc || '',\n    received_at_kst: email.received_at_kst || original.received_at_kst || '',\n    source_mailbox: email.source_mailbox || original.source_mailbox || 'core_credential_mailbox',\n    intake_channel: email.intake_channel || original.intake_channel || 'unknown',\n    is_forwarded_to_core: email.is_forwarded_to_core === true || original.is_forwarded_to_core === true,\n    attachments: Array.isArray(email.attachments) ? email.attachments : Array.isArray(original.attachments) ? original.attachments : [],\n    document_parse_status: email.document_parse_status || original.document_parse_status || '',\n    document_text: email.document_text || original.document_text || '',\n    document_summary: email.document_summary || original.document_summary || '',\n    parsed_attachments: Array.isArray(email.parsed_attachments) ? email.parsed_attachments : Array.isArray(original.parsed_attachments) ? original.parsed_attachments : [],\n    document_parse_error: email.document_parse_error || original.document_parse_error || '',\n    information_extract_status: email.information_extract_status || '',\n    extracted_student_info: email.extracted_student_info || {},\n    extracted_request_info: email.extracted_request_info || {}\n  };\n\n  const classificationInput = {\n    core_policy: {\n      core_is_central_mailbox: true,\n      core_mailbox_is_gmail_trigger_credential: true,\n      core_email_address_is_not_hardcoded: true,\n      simple_faq_auto_reply_from_core: true,\n      complex_admin_inquiry_route_to_department: true,\n      department_sends_final_student_reply: false,\n      non_faq_must_be_assigned_to_department: true,\n      department_emails_are_real_delivery_targets: true\n    },\n    actual_gmail_input: actualGmailInput,\n    department_email_mapping: DEPARTMENT_EMAILS\n  };\n\n  const systemPrompt = [\n    'You are Mailman Core email classifier for a Korean university back office.',\n    'You receive ONE student email (subject, body, attachments, extracted info, and parsed PDF text when available) and you MUST classify it.',\n    '',\n    'You MUST choose exactly ONE core_action value:',\n    '  - \"auto_reply\": simple FAQ about schedules, deadlines, methods, locations, or guidance pages. No attachment, no personal info check, no document review, no eligibility judgement, no administrative processing.',\n    '  - \"route_to_department\": every non-FAQ email. If the email is ambiguous, complex, risky, low confidence, or mentions multiple departments, still choose the single best first responsible department.',\n    '',\n    'STRICT POLICY:',\n    '1. Never return manual_review. That value is not allowed.',\n    '2. Every non-FAQ email MUST be route_to_department.',\n    '3. For route_to_department, department_id MUST be exactly one of: admissions, finance_team, academic_records, international_team.',\n    '4. For route_to_department, choose exactly one of the four departments and fill department_id, department_name, and department_email from department_email_mapping.',\n    '5. If uncertain, choose the best primary department anyway. Low confidence is not a reason to avoid department assignment.',\n    '6. If Document Parse returned parsed PDF text, treat that parsed text as part of the student inquiry and use it for department routing. Do not route based only on the attachment filename.',\n    '',\n    'DEPARTMENT ROUTING POLICY:',\n    '1. 국제학생, 비자, 교환학생, 유학생, 해외대학, 영어 문의, international, visa, exchange student -> international_team.',\n    '2. 등록금, 납부, 환불, 결제, tuition, payment, refund -> finance_team.',\n    '3. 입학, 원서, 지원, admission, application -> admissions.',\n    '4. 학적, 성적표, 증명서, 졸업, 휴학, 복학, transcript, certificate, graduation -> academic_records.',\n    '',\n    'STRICT OUTPUT RULES:',\n    '1. Return ONLY a single JSON object. No markdown, no code fence, no prose, no leading or trailing text.',\n    '2. Fill EVERY field with the value you actually decided. Do NOT echo the schema placeholders. Pick exactly ONE core_action: auto_reply or route_to_department.',\n    '3. confidence MUST be a real decimal number between 0 and 1 reflecting your certainty.',\n    '4. Booleans are real JSON booleans (true / false), not strings.',\n    '5. department_id, department_name, department_email MUST come from the department_email_mapping in the user message. For auto_reply, leave department_id/_name/_email as empty strings.',\n    '6. reason and routing_summary MUST be one short Korean sentence each, based on the actual email content.',\n    '7. For auto_reply, write draft_reply as a short Korean answer to the student. For route_to_department, draft_reply may be empty.',\n    '8. Required output fields and types:',\n    '   is_faq: boolean',\n    '   auto_reply: boolean',\n    '   auto_reply_allowed: boolean',\n    '   route_to_department: boolean',\n    '   department_id: string',\n    '   department_name: string',\n    '   department_email: string',\n    '   confidence: number (0.0 to 1.0)',\n    '   manual_review: false',\n    '   reason: string (Korean)',\n    '   draft_reply: string (Korean, may be empty)',\n    '   routing_summary: string (Korean)',\n    '   core_action: one of \"auto_reply\" or \"route_to_department\"'\n  ].join('\\n');\n\n  const a = actualGmailInput;\n  const student = a.extracted_student_info || {};\n  const req = a.extracted_request_info || {};\n  const attachmentLines = a.attachments.length === 0\n    ? 'none'\n    : a.attachments.map((att) => '- ' + (att.filename || '(no filename)') + ' (' + (att.mime_type || 'unknown') + ')').join('\\n');\n\n  const userPrompt = [\n    'Classify the following email. Use ONLY this email content.',\n    '',\n    '=== EMAIL ===',\n    'Subject: ' + a.subject,\n    'From: ' + a.from_email,\n    'Received: ' + a.received_at_kst,\n    'Source mailbox: ' + a.source_mailbox,\n    'Intake channel: ' + a.intake_channel,\n    'Forwarded to Core: ' + (a.is_forwarded_to_core ? 'yes' : 'no'),\n    '',\n    'Body:',\n    a.body || '(empty)',\n    '',\n    '=== ATTACHMENTS ===',\n    attachmentLines,\n    '',\n    '=== DOCUMENT PARSE RESULT ===',\n    'Status: ' + (a.document_parse_status || 'n/a'),\n    'Summary: ' + (a.document_summary || '(none)'),\n    'Parsed attachment files: ' + (a.parsed_attachments.length === 0 ? '(none)' : a.parsed_attachments.map((att) => (att.filename || '(no filename)') + ' / ' + (att.parse_status || 'unknown')).join(', ')),\n    'Parsed PDF/Text content:',\n    a.document_text || '(none)',\n    '',\n    '=== INFORMATION EXTRACT RESULT ===',\n    'Status: ' + (a.information_extract_status || 'n/a'),\n    'Student: ' + (student.student_name || '(unknown)') + ' / ID ' + (student.student_id || '(unknown)') + ' / ' + (student.department || '(unknown)') + ' / ' + (student.grade || '(unknown)'),\n    'Inquiry type: ' + (req.inquiry_type || '(unknown)'),\n    'Document type: ' + (req.document_type || '(none)'),\n    'Request summary: ' + (req.request_summary || '(unknown)'),\n    'Requested action: ' + (req.requested_action || '(unknown)'),\n    '',\n    '=== DEPARTMENT EMAIL MAPPING ===',\n    deptList(),\n    '',\n    'Return ONLY the JSON object now. Do not include schema text. Pick exactly one core_action value: auto_reply or route_to_department.'\n  ].join('\\n');\n\n  item.json.original_email_context = email.original_email_context || {\n    message_id: actualGmailInput.message_id,\n    from_email: actualGmailInput.from_email,\n    subject: actualGmailInput.subject,\n    body: actualGmailInput.body,\n    received_at: actualGmailInput.received_at,\n    received_at_utc: actualGmailInput.received_at_utc,\n    received_at_kst: actualGmailInput.received_at_kst,\n    attachments: actualGmailInput.attachments,\n    source_mailbox: actualGmailInput.source_mailbox,\n    intake_channel: actualGmailInput.intake_channel,\n    is_forwarded_to_core: actualGmailInput.is_forwarded_to_core,\n    document_parse_status: actualGmailInput.document_parse_status,\n    document_text: actualGmailInput.document_text,\n    document_summary: actualGmailInput.document_summary,\n    parsed_attachments: actualGmailInput.parsed_attachments,\n    document_parse_error: actualGmailInput.document_parse_error\n  };\n  Object.assign(item.json, actualGmailInput);\n  item.json.department_email_mapping = DEPARTMENT_EMAILS;\n  item.json.classification_input = classificationInput;\n  item.json.solar_classification_request = {\n    model_todo: 'Confirm Solar model name in Upstage Console. Current model is solar-pro3.',\n    messages: [\n      { role: 'system', content: systemPrompt },\n      { role: 'user', content: userPrompt }\n    ],\n    response_format_todo: 'Use official JSON-only/response_format option if supported. Otherwise validate JSON in n8n.'\n  };\n\n  item.json.debug_reason = Array.isArray(item.json.debug_reason) ? item.json.debug_reason : [];\n  item.json.debug_reason.push('solar_prompt_four_department_routing');\n  if (!actualGmailInput.subject && !actualGmailInput.body) {\n    item.json.debug_reason.push('missing_subject_body_before_solar_input');\n  }\n\n  return item;\n});"
+      },
+      "id": "df2c96a8-8399-4588-9a9b-d842d18d0e69",
+      "name": "Prepare Solar Classification Input Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -7136,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upstage.ai/v1/solar/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: 'solar-pro3', messages: $json.solar_classification_request.messages, response_format: { type: 'json_object' } } }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "6c974eca-b986-49d0-b639-ce49e7d7688d",
+      "name": "Solar LLM Classification HTTP Request Node",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -6880,
+        288
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ZTlGZrexjsva53YF",
+          "name": "Upstage API Key"
+        }
+      },
+      "continueOnFail": true,
+      "notes": "TODO: Confirm Solar endpoint, model name, messages body, and JSON-only response_format in Upstage Console API Reference. Prompt uses only current item actual Gmail input; no sample email data or API key is hardcoded."
+    },
+    {
+      "parameters": {
+        "functionCode": "const DEPARTMENT_EMAILS = {\n  admissions: { department_name: '\\uC785\\uD559\\uCC98', department_email: 'admissions-demo@example.com' },\n  finance_team: { department_name: '\\uC7AC\\uBB34\\uD300', department_email: 'finance-demo@example.com' },\n  academic_records: { department_name: '\\uD559\\uC801\\uD300', department_email: 'records-demo@example.com' },\n  international_team: { department_name: '\\uAD6D\\uC81C\\uD300', department_email: 'international-demo@example.com' }\n};\n\nconst LEGACY_DEPARTMENT_ALIASES = {\n  academic_affairs: 'academic_records',\n  scholarship_team: 'finance_team',\n  dormitory_team: 'academic_records'\n};\n\nfunction includesAny(text, keywords) {\n  return keywords.some((keyword) => text.includes(keyword.toLowerCase()));\n}\n\nfunction inferDepartment(text) {\n  const t = String(text || '').toLowerCase();\n  if (includesAny(t, ['\\uAD6D\\uC81C', '\\uC720\\uD559\\uC0DD', '\\uBE44\\uC790', '\\uAD50\\uD658\\uD559\\uC0DD', '\\uD574\\uC678', 'international', 'visa', 'exchange student'])) return 'international_team';\n  if (includesAny(t, ['\\uC785\\uD559', '\\uC6D0\\uC11C', '\\uC9C0\\uC6D0', 'admission', 'application'])) return 'admissions';\n  if (includesAny(t, ['\\uB4F1\\uB85D\\uAE08', '\\uB0A9\\uBD80', '\\uD658\\uBD88', '\\uACB0\\uC81C', 'tuition', 'payment', 'refund'])) return 'finance_team';\n  if (includesAny(t, ['\\uD559\\uC801', '\\uC131\\uC801\\uD45C', '\\uC99D\\uBA85\\uC11C', '\\uC878\\uC5C5', '\\uD734\\uD559', '\\uBCF5\\uD559', 'transcript', 'certificate', 'graduation'])) return 'academic_records';\n  if (includesAny(t, ['\\uC7A5\\uD559\\uAE08', 'scholarship'])) return 'finance_team';\n  if (includesAny(t, ['\\uAE30\\uC219\\uC0AC', 'dormitory'])) return 'academic_records';\n  if (includesAny(t, ['\\uC218\\uAC15\\uC2E0\\uCCAD', '\\uD559\\uC0AC\\uC77C\\uC815', 'course registration', 'class schedule'])) return 'academic_records';\n  return 'academic_records';\n}\n\nfunction normalizeDepartmentId(value, text) {\n  const raw = String(value || '').trim();\n  if (DEPARTMENT_EMAILS[raw]) return raw;\n  if (LEGACY_DEPARTMENT_ALIASES[raw]) return LEGACY_DEPARTMENT_ALIASES[raw];\n  return inferDepartment(text);\n}\n\nfunction applyDepartmentFields(target, departmentId) {\n  const safeId = DEPARTMENT_EMAILS[departmentId] ? departmentId : 'academic_records';\n  const dept = DEPARTMENT_EMAILS[safeId];\n  target.department_id = safeId;\n  target.department_name = dept.department_name;\n  target.department_email = dept.department_email;\n  return safeId;\n}\n\nfunction extractText(response) {\n  if (!response) return '';\n  if (typeof response === 'string') return response;\n  return (response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content) || response.output || response.text || response.content || response.result || JSON.stringify(response);\n}\nfunction parseJsonLoose(text) {\n  if (!text) throw new Error('empty Solar response');\n  if (typeof text === 'object') return text;\n  try { return JSON.parse(text); } catch (error) {\n    const match = String(text).match(/\\{[\\s\\S]*\\}/);\n    if (!match) throw error;\n    return JSON.parse(match[0]);\n  }\n}\nfunction toBool(value) { return value === true || value === 'true' || value === 'TRUE' || value === 1 || value === '1'; }\nfunction parseConfidence() {\n  const values = Array.prototype.slice.call(arguments);\n  for (const value of values) {\n    if (value === undefined || value === null || value === '') continue;\n    let text = String(value).trim();\n    let number = text.endsWith('%') ? Number(text.slice(0, -1).trim()) / 100 : Number(text);\n    if (Number.isFinite(number) && number > 1) number = number / 100;\n    if (Number.isFinite(number)) return Math.max(0, Math.min(1, number));\n  }\n  return 0;\n}\nfunction normalizeCoreAction(value) {\n  const action = String(value || '').trim().toLowerCase();\n  if (action === 'auto' || action === 'auto_reply' || action === 'auto_reply_from_core' || action === 'faq') return 'auto_reply';\n  if (action === 'forward' || action === 'routing' || action === 'department_routing' || action === 'route_to_department') return 'route_to_department';\n  return 'route_to_department';\n}\nfunction upstreamSolarJson(index) {\n  try {\n    if (typeof $items === 'function') {\n      const upstream = $items('Prepare Solar Classification Input Function Node', 0, 0) || [];\n      return (upstream[index] && upstream[index].json) || {};\n    }\n  } catch (error) {}\n  try {\n    if (typeof $node !== 'undefined' && $node['Prepare Solar Classification Input Function Node'] && $node['Prepare Solar Classification Input Function Node'].json) {\n      return $node['Prepare Solar Classification Input Function Node'].json;\n    }\n  } catch (error) {}\n  return {};\n}\nfunction mergeOriginalEmailContext(email, upstream) {\n  const original = email.original_email_context || upstream.original_email_context || {};\n  const merged = {\n    message_id: email.message_id || upstream.message_id || original.message_id || '',\n    from_email: email.from_email || upstream.from_email || original.from_email || '',\n    subject: email.subject || upstream.subject || original.subject || '',\n    body: email.body || upstream.body || original.body || '',\n    received_at: email.received_at || upstream.received_at || original.received_at || '',\n    received_at_utc: email.received_at_utc || upstream.received_at_utc || original.received_at_utc || '',\n    received_at_kst: email.received_at_kst || upstream.received_at_kst || original.received_at_kst || '',\n    attachments: Array.isArray(email.attachments) ? email.attachments : Array.isArray(upstream.attachments) ? upstream.attachments : Array.isArray(original.attachments) ? original.attachments : [],\n    source_mailbox: email.source_mailbox || upstream.source_mailbox || original.source_mailbox || 'core_credential_mailbox',\n    intake_channel: email.intake_channel || upstream.intake_channel || original.intake_channel || 'unknown',\n    is_forwarded_to_core: email.is_forwarded_to_core === true || upstream.is_forwarded_to_core === true || original.is_forwarded_to_core === true,\n    document_parse_status: email.document_parse_status || upstream.document_parse_status || original.document_parse_status || '',\n    document_text: email.document_text || upstream.document_text || original.document_text || '',\n    document_summary: email.document_summary || upstream.document_summary || original.document_summary || '',\n    parsed_attachments: Array.isArray(email.parsed_attachments) ? email.parsed_attachments : Array.isArray(upstream.parsed_attachments) ? upstream.parsed_attachments : Array.isArray(original.parsed_attachments) ? original.parsed_attachments : [],\n    document_parse_error: email.document_parse_error || upstream.document_parse_error || original.document_parse_error || ''\n  };\n  return { ...original, ...merged };\n}\n\nreturn items.map((item, index) => {\n  const email = item.json || {};\n  const upstream = upstreamSolarJson(index);\n  const originalEmailContext = mergeOriginalEmailContext(email, upstream);\n  Object.assign(item.json, upstream, email, originalEmailContext, { original_email_context: originalEmailContext });\n  const debug = Array.isArray(item.json.debug_reason) ? item.json.debug_reason : Array.isArray(upstream.debug_reason) ? upstream.debug_reason : [];\n  const response = email.solar_classification_api_response || email;\n  const httpError = response.error || response.statusCode >= 400;\n  const text = [item.json.subject, item.json.body, item.json.document_text, item.json.document_summary].filter(Boolean).join('\\n').toLowerCase();\n\n  try {\n    if (httpError) throw new Error((response.error && (response.error.message || JSON.stringify(response.error))) || response.message || 'Solar API request failed.');\n    const rawText = extractText(response);\n    const parsed = parseJsonLoose(rawText);\n    const raw = parsed.expected_json_output && typeof parsed.expected_json_output === 'object' ? parsed.expected_json_output : parsed;\n    const normalizedAction = normalizeCoreAction(raw.core_action || parsed.core_action || '');\n    if (String(raw.core_action || '').toLowerCase().includes('manual')) debug.push('solar_manual_review_forced_to_department');\n\n    let departmentId = String(raw.department_id || '').trim();\n    if (normalizedAction !== 'auto_reply') {\n      const before = departmentId;\n      departmentId = normalizeDepartmentId(departmentId, text);\n      if (before !== departmentId) debug.push('department_normalized_to_four_department_mapping');\n    }\n    const dept = DEPARTMENT_EMAILS[departmentId] || DEPARTMENT_EMAILS.academic_records;\n    const confidence = parseConfidence(raw.confidence, parsed.confidence, parsed.score, raw.score);\n    item.json.classification_result = {\n      is_faq: toBool(raw.is_faq) && normalizedAction === 'auto_reply',\n      auto_reply: toBool(raw.auto_reply) && normalizedAction === 'auto_reply',\n      auto_reply_allowed: toBool(raw.auto_reply_allowed) && normalizedAction === 'auto_reply',\n      route_to_department: normalizedAction !== 'auto_reply',\n      department_id: normalizedAction === 'auto_reply' ? '' : departmentId,\n      department_name: normalizedAction === 'auto_reply' ? '' : dept.department_name,\n      department_email: normalizedAction === 'auto_reply' ? '' : dept.department_email,\n      confidence,\n      manual_review: false,\n      reason: String(raw.reason || ''),\n      draft_reply: String(raw.draft_reply || ''),\n      routing_summary: String(raw.routing_summary || ''),\n      core_action: normalizedAction\n    };\n    item.json.solar_classification_status = 'success';\n    item.json.solar_classification_error = '';\n    item.json.solar_response_excerpt = String(rawText).slice(0, 400);\n    item.json.debug_reason = debug;\n  } catch (error) {\n    const departmentId = inferDepartment(text);\n    const dept = DEPARTMENT_EMAILS[departmentId];\n    item.json.classification_result = {\n      is_faq: false,\n      auto_reply: false,\n      auto_reply_allowed: false,\n      route_to_department: true,\n      department_id: departmentId,\n      department_name: dept.department_name,\n      department_email: dept.department_email,\n      confidence: 0,\n      manual_review: false,\n      reason: 'Solar classification failed, so the email was assigned by fallback department rules.',\n      draft_reply: '',\n      routing_summary: 'Fallback department assignment was applied because Solar classification did not return valid output.',\n      core_action: 'route_to_department'\n    };\n    item.json.solar_classification_status = 'failed';\n    item.json.solar_classification_error = error.message || String(error);\n    item.json.solar_response_excerpt = String(extractText(response)).slice(0, 400);\n    item.json.manual_review = false;\n    debug.push('solar_failed_forced_to_department');\n    item.json.debug_reason = debug;\n  }\n  return item;\n});"
+      },
+      "id": "345a5399-e3e2-469d-b31d-240dc731b4ab",
+      "name": "Normalize Solar Classification Result Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -6624,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const DEPARTMENT_EMAILS = {\n  admissions: { department_name: '\\uC785\\uD559\\uCC98', department_email: 'admissions-demo@example.com' },\n  finance_team: { department_name: '\\uC7AC\\uBB34\\uD300', department_email: 'finance-demo@example.com' },\n  academic_records: { department_name: '\\uD559\\uC801\\uD300', department_email: 'records-demo@example.com' },\n  international_team: { department_name: '\\uAD6D\\uC81C\\uD300', department_email: 'international-demo@example.com' }\n};\n\nconst LEGACY_DEPARTMENT_ALIASES = {\n  academic_affairs: 'academic_records',\n  scholarship_team: 'finance_team',\n  dormitory_team: 'academic_records'\n};\n\nfunction includesAny(text, keywords) {\n  return keywords.some((keyword) => text.includes(keyword.toLowerCase()));\n}\n\nfunction inferDepartment(text) {\n  const t = String(text || '').toLowerCase();\n  if (includesAny(t, ['\\uAD6D\\uC81C', '\\uC720\\uD559\\uC0DD', '\\uBE44\\uC790', '\\uAD50\\uD658\\uD559\\uC0DD', '\\uD574\\uC678', 'international', 'visa', 'exchange student'])) return 'international_team';\n  if (includesAny(t, ['\\uC785\\uD559', '\\uC6D0\\uC11C', '\\uC9C0\\uC6D0', 'admission', 'application'])) return 'admissions';\n  if (includesAny(t, ['\\uB4F1\\uB85D\\uAE08', '\\uB0A9\\uBD80', '\\uD658\\uBD88', '\\uACB0\\uC81C', 'tuition', 'payment', 'refund'])) return 'finance_team';\n  if (includesAny(t, ['\\uD559\\uC801', '\\uC131\\uC801\\uD45C', '\\uC99D\\uBA85\\uC11C', '\\uC878\\uC5C5', '\\uD734\\uD559', '\\uBCF5\\uD559', 'transcript', 'certificate', 'graduation'])) return 'academic_records';\n  if (includesAny(t, ['\\uC7A5\\uD559\\uAE08', 'scholarship'])) return 'finance_team';\n  if (includesAny(t, ['\\uAE30\\uC219\\uC0AC', 'dormitory'])) return 'academic_records';\n  if (includesAny(t, ['\\uC218\\uAC15\\uC2E0\\uCCAD', '\\uD559\\uC0AC\\uC77C\\uC815', 'course registration', 'class schedule'])) return 'academic_records';\n  return 'academic_records';\n}\n\nfunction normalizeDepartmentId(value, text) {\n  const raw = String(value || '').trim();\n  if (DEPARTMENT_EMAILS[raw]) return raw;\n  if (LEGACY_DEPARTMENT_ALIASES[raw]) return LEGACY_DEPARTMENT_ALIASES[raw];\n  return inferDepartment(text);\n}\n\nfunction applyDepartmentFields(target, departmentId) {\n  const safeId = DEPARTMENT_EMAILS[departmentId] ? departmentId : 'academic_records';\n  const dept = DEPARTMENT_EMAILS[safeId];\n  target.department_id = safeId;\n  target.department_name = dept.department_name;\n  target.department_email = dept.department_email;\n  return safeId;\n}\n\nconst FAQ_KEYWORDS = [\n  '수강신청', '방학', '학사일정', '장학금 신청 기간', '장학금 공지',\n  '기숙사 신청 기간', '기숙사 안내', '증명서 발급 방법', '발급 방법', '신청 기간', '제출 마감일',\n  '안내 페이지', '어디에서 확인', '어디서 확인'\n];\nconst QUESTION_HINTS = ['언제', '기간', '일정', '방법', '어디', '어디서', '어디에서', '확인 위치', '안내', '페이지', '마감일'];\nconst RISKY_KEYWORDS = [\n  '확인해주세요', '검토해주세요', '처리해주세요', '신청서 제출', '서류 제출', '첨부했습니다', '첨부파일',\n  '제 자격', '대상자인지', '환불', '학적 변경', '휴학 처리', '졸업요건 충족', '성적표', '개인정보', '학번'\n];\nfunction bool(value) { return value === true; }\nfunction num(value) {\n  let n = Number(value);\n  if (!Number.isFinite(n)) return 0;\n  if (n > 1) n = n / 100;\n  return Math.max(0, Math.min(1, n));\n}\nfunction normalizeCoreAction(value) {\n  const action = String(value || '').trim().toLowerCase();\n  if (action === 'auto' || action === 'auto_reply' || action === 'auto_reply_from_core' || action === 'faq') return 'auto_reply';\n  return 'route_to_department';\n}\nfunction applyDepartment(result, text) {\n  const departmentId = normalizeDepartmentId(result.department_id, text);\n  applyDepartmentFields(result, departmentId);\n  if (!result.reason) result.reason = '비FAQ 메일이므로 가장 적합한 1차 담당 부서로 자동 배정함.';\n  if (!result.routing_summary) result.routing_summary = result.department_name + '에서 처리할 문의로 자동 배정됨.';\n}\n\nreturn items.map((item) => {\n  const email = item.json || {};\n  const result = email.classification_result || {};\n  const original = email.original_email_context || {};\n  const subject = email.subject || original.subject || '';\n  const body = email.body || original.body || '';\n  const attachments = Array.isArray(email.attachments) ? email.attachments : Array.isArray(original.attachments) ? original.attachments : [];\n  const debug = Array.isArray(email.debug_reason) ? email.debug_reason : [];\n  const blockingRules = [];\n  if (!subject && !body) debug.push('missing_subject_body_before_validation');\n  const text = (subject + '\\n' + body + '\\n' + (email.document_text || original.document_text || '') + '\\n' + (email.document_summary || original.document_summary || '')).toLowerCase();\n  const debugOriginalCoreAction = String(result.core_action || '');\n  const debugOriginalConfidence = result.confidence;\n\n  result.confidence = num(result.confidence);\n  result.is_faq = bool(result.is_faq);\n  result.auto_reply = bool(result.auto_reply);\n  result.auto_reply_allowed = bool(result.auto_reply_allowed);\n  result.route_to_department = bool(result.route_to_department);\n  result.manual_review = false;\n  result.department_id = String(result.department_id || '');\n  result.department_name = String(result.department_name || '');\n  result.department_email = String(result.department_email || '');\n  result.reason = String(result.reason || '');\n  result.draft_reply = String(result.draft_reply || '');\n  result.routing_summary = String(result.routing_summary || '');\n  result.core_action = normalizeCoreAction(result.core_action);\n  if (debugOriginalCoreAction && result.core_action !== debugOriginalCoreAction) debug.push('core_action_forced_to_' + result.core_action);\n\n  const hasFaqKeyword = includesAny(text, FAQ_KEYWORDS);\n  const hasQuestionHint = includesAny(text, QUESTION_HINTS);\n  const hasRiskyKeyword = includesAny(text, RISKY_KEYWORDS);\n  const hasAttachments = attachments.length > 0;\n  if (hasRiskyKeyword) blockingRules.push('risky_keyword_present');\n  if (hasAttachments) blockingRules.push('attachment_present');\n\n  const canInferFaq = hasFaqKeyword && hasQuestionHint && !hasAttachments && !hasRiskyKeyword;\n  if (canInferFaq) {\n    result.is_faq = true;\n    result.auto_reply = true;\n    result.auto_reply_allowed = true;\n    result.route_to_department = false;\n    result.manual_review = false;\n    result.core_action = 'auto_reply';\n    result.department_id = '';\n    result.department_name = '';\n    result.department_email = '';\n    if (result.confidence < 0.9) {\n      result.confidence = 0.9;\n      debug.push('confidence_inferred_from_faq_keywords');\n    }\n    result.reason = result.reason || '단순 일정/방법/위치 안내 FAQ로 판단되어 Core 자동응답 후보로 분류함.';\n    debug.push('faq_override_applied');\n  } else {\n    result.core_action = 'route_to_department';\n    result.is_faq = false;\n    result.auto_reply = false;\n    result.auto_reply_allowed = false;\n    result.route_to_department = true;\n    result.manual_review = false;\n    applyDepartment(result, text);\n    debug.push('non_faq_forced_to_department_assignment');\n  }\n\n  item.json.classification_result = result;\n  item.json.is_faq = result.is_faq;\n  item.json.auto_reply = result.auto_reply;\n  item.json.auto_reply_allowed = result.auto_reply_allowed;\n  item.json.route_to_department = result.route_to_department;\n  item.json.core_action = result.core_action;\n  item.json.department_id = result.department_id;\n  item.json.department_name = result.department_name;\n  item.json.department_email = result.department_email;\n  item.json.confidence = result.confidence;\n  item.json.manual_review = false;\n  item.json.reason = result.reason;\n  item.json.draft_reply = result.draft_reply;\n  item.json.routing_summary = result.routing_summary;\n  item.json.delivery_status = result.core_action === 'auto_reply' ? 'auto_reply_candidate' : 'routing_candidate';\n  item.json.debug_reason = Array.from(new Set(debug));\n  item.json.debug_original_core_action = debugOriginalCoreAction;\n  item.json.debug_final_core_action = result.core_action;\n  item.json.debug_original_confidence = debugOriginalConfidence;\n  item.json.debug_final_confidence = result.confidence;\n  item.json.debug_blocking_rules = blockingRules;\n  item.json.error_summary = '';\n  return item;\n});"
+      },
+      "id": "4ac7a5ea-24aa-48a7-b0ee-6eae9e70ceae",
+      "name": "Validate Classification Output Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -6368,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.core_action }}",
+                    "rightValue": "auto_reply",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.core_action }}",
+                    "rightValue": "route_to_department",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "76c76c68-5b4b-47c6-b44c-14d6a9ae03ee",
+      "name": "Route Core Action IF/Switch Node",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -6096,
+        288
+      ],
+      "notes": "Routes only normalized core_action values: auto_reply and route_to_department."
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  const json = item.json || {};\n  const result = json.classification_result || {};\n  if (json.core_action !== 'auto_reply' && result.core_action !== 'auto_reply') {\n    item.json = {\n      ...json,\n      debug_reason: Array.from(new Set([...(Array.isArray(json.debug_reason) ? json.debug_reason : []), 'auto_reply_output_guard_blocked_non_auto_item'])),\n      auto_reply: false,\n      auto_reply_allowed: false,\n      manual_review: false,\n      no_actual_email_sent: true\n    };\n    return item;\n  }\n\n  const draft = json.draft_reply || result.draft_reply || '안녕하세요. 문의하신 내용에 대해 안내드립니다. 추가 문의가 필요하시면 다시 연락해 주세요.';\n  item.json = {\n    ...json,\n    status: 'auto_reply_sent',\n    delivery_status: 'auto_reply_sent',\n    auto_reply: true,\n    route_to_department: false,\n    manual_review: false,\n    ui_status: '자동응답 완료',\n    assignment_status: 'auto_replied',\n    department_inbox_visible: false,\n    auto_ack_sent: true,\n    auto_ack_body: draft,\n    needs_review: false,\n    core_final_reply_policy: 'Core representative mailbox auto-replied to the student by Gmail Send.',\n    no_actual_email_sent: false\n  };\n  return item;\n});"
+      },
+      "id": "b9b45763-f1a4-4caf-aaef-b1e83af6a52e",
+      "name": "Auto Reply Candidate Output Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -5840,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const DEPARTMENT_EMAILS = {\n  admissions: { department_name: '\\uC785\\uD559\\uCC98', department_email: 'admissions-demo@example.com' },\n  finance_team: { department_name: '\\uC7AC\\uBB34\\uD300', department_email: 'finance-demo@example.com' },\n  academic_records: { department_name: '\\uD559\\uC801\\uD300', department_email: 'records-demo@example.com' },\n  international_team: { department_name: '\\uAD6D\\uC81C\\uD300', department_email: 'international-demo@example.com' }\n};\n\nconst LEGACY_DEPARTMENT_ALIASES = {\n  academic_affairs: 'academic_records',\n  scholarship_team: 'finance_team',\n  dormitory_team: 'academic_records'\n};\n\nfunction includesAny(text, keywords) {\n  return keywords.some((keyword) => text.includes(keyword.toLowerCase()));\n}\n\nfunction inferDepartment(text) {\n  const t = String(text || '').toLowerCase();\n  if (includesAny(t, ['\\uAD6D\\uC81C', '\\uC720\\uD559\\uC0DD', '\\uBE44\\uC790', '\\uAD50\\uD658\\uD559\\uC0DD', '\\uD574\\uC678', 'international', 'visa', 'exchange student'])) return 'international_team';\n  if (includesAny(t, ['\\uC785\\uD559', '\\uC6D0\\uC11C', '\\uC9C0\\uC6D0', 'admission', 'application'])) return 'admissions';\n  if (includesAny(t, ['\\uB4F1\\uB85D\\uAE08', '\\uB0A9\\uBD80', '\\uD658\\uBD88', '\\uACB0\\uC81C', 'tuition', 'payment', 'refund'])) return 'finance_team';\n  if (includesAny(t, ['\\uD559\\uC801', '\\uC131\\uC801\\uD45C', '\\uC99D\\uBA85\\uC11C', '\\uC878\\uC5C5', '\\uD734\\uD559', '\\uBCF5\\uD559', 'transcript', 'certificate', 'graduation'])) return 'academic_records';\n  if (includesAny(t, ['\\uC7A5\\uD559\\uAE08', 'scholarship'])) return 'finance_team';\n  if (includesAny(t, ['\\uAE30\\uC219\\uC0AC', 'dormitory'])) return 'academic_records';\n  if (includesAny(t, ['\\uC218\\uAC15\\uC2E0\\uCCAD', '\\uD559\\uC0AC\\uC77C\\uC815', 'course registration', 'class schedule'])) return 'academic_records';\n  return 'academic_records';\n}\n\nfunction normalizeDepartmentId(value, text) {\n  const raw = String(value || '').trim();\n  if (DEPARTMENT_EMAILS[raw]) return raw;\n  if (LEGACY_DEPARTMENT_ALIASES[raw]) return LEGACY_DEPARTMENT_ALIASES[raw];\n  return inferDepartment(text);\n}\n\nfunction applyDepartmentFields(target, departmentId) {\n  const safeId = DEPARTMENT_EMAILS[departmentId] ? departmentId : 'academic_records';\n  const dept = DEPARTMENT_EMAILS[safeId];\n  target.department_id = safeId;\n  target.department_name = dept.department_name;\n  target.department_email = dept.department_email;\n  return safeId;\n}\n\nreturn items.map((item) => {\n  const json = item.json || {};\n  const result = json.classification_result || {};\n  const extracted = json.extracted_request_info || {};\n  const text = [json.subject, json.body, json.document_text, json.document_summary].filter(Boolean).join('\\n').toLowerCase();\n  const departmentId = normalizeDepartmentId(json.department_id || result.department_id, text);\n  const dept = DEPARTMENT_EMAILS[departmentId];\n  const assignmentReason = json.reason || result.reason || json.routing_summary || result.routing_summary || '비FAQ 메일을 가장 적합한 1차 담당 부서로 자동 배정함.';\n  const parsedDocumentText = json.document_parse_status === 'success' ? String(json.document_text || '') : '';\n  const parsedDocumentSummary = json.document_parse_status === 'success' ? String(json.document_summary || '') : '';\n  const parsedAttachments = Array.isArray(json.parsed_attachments) ? json.parsed_attachments : [];\n  const mailSummary = extracted.request_summary || json.routing_summary || result.routing_summary || parsedDocumentSummary || json.body || json.subject || '';\n  item.json = {\n    ...json,\n    status: 'routing_candidate',\n    delivery_status: 'routing_candidate',\n    core_action: 'route_to_department',\n    auto_reply: false,\n    auto_reply_allowed: false,\n    route_to_department: true,\n    manual_review: false,\n    ui_status: '자동 배정 완료',\n    assignment_status: 'assigned',\n    department_inbox_visible: true,\n    department_id: departmentId,\n    department_name: dept.department_name,\n    department_email: dept.department_email,\n    assigned_department_id: departmentId,\n    assigned_department_name: dept.department_name,\n    assigned_department_email: dept.department_email,\n    assignment_reason: assignmentReason,\n    mail_summary: mailSummary,\n    document_parse_status: json.document_parse_status || '',\n    document_text: parsedDocumentText,\n    document_summary: parsedDocumentSummary,\n    parsed_attachments: parsedAttachments,\n    original_attachment_list: Array.isArray(json.attachments) ? json.attachments : [],\n    needs_review: false,\n    department_delivery_ready: true,\n    department_delivery_mode: 'gmail_send',\n    department_delivery_target: {\n      department_id: departmentId,\n      department_name: dept.department_name,\n      department_email: dept.department_email\n    },\n    department_delivery_payload: {\n      student_email: json.from_email || '',\n      subject: json.subject || '',\n      body: json.body || '',\n      summary: mailSummary,\n      assignment_reason: assignmentReason,\n      parsed_document_text: parsedDocumentText,\n      parsed_document_summary: parsedDocumentSummary,\n      parsed_attachments: parsedAttachments,\n      attachments: [],\n      received_at_kst: json.received_at_kst || ''\n    }\n  };\n  return { json: item.json };\n});"
+      },
+      "id": "bd6acbf4-e3b5-4bc4-9c24-7b334db64548",
+      "name": "Department Assigned Inbox Output Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -5840,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "return items.map((item) => {\n  const email = item.json || {};\n  const classification = email.classify_and_draft || {\n    status: 'mock_classification_fallback',\n    department_id: 'academic_affairs',\n    department_name: '\\uD559\\uC0AC\\uD300',\n    department_email: 'academic-affairs@university.ac.kr',\n    confidence: 0,\n    reason: 'use_mock=true 데모 fallback 경로입니다. use_mock=false 경로에서는 Step 11-6 Solar LLM Classification output 분기로 이동합니다.',\n    is_faq: false,\n    auto_reply: false,\n    auto_reply_allowed: false,\n    route_to_department: true,\n    core_action: 'route_to_department',\n    manual_review: false,\n    draft_reply: '',\n    routing_summary: 'Mock fallback output only. Actual email sending is not implemented.'\n  };\n\n  return {\n    json: {\n      message_id: email.message_id || '',\n      from_email: email.from_email || 'unknown_sender',\n      subject: email.subject || '',\n      body: email.body || '',\n      received_at: email.received_at || '',\n      received_at_utc: email.received_at_utc || '',\n      received_at_kst: email.received_at_kst || '',\n      source_mailbox: email.source_mailbox || 'core_credential_mailbox',\n      intake_channel: email.intake_channel || 'unknown',\n      is_forwarded_to_core: email.is_forwarded_to_core === true,\n      virtual_department_emails: email.virtual_department_emails || {},\n      attachments: Array.isArray(email.attachments) ? email.attachments : [],\n      document_parse_status: email.document_parse_status || '',\n      document_text: email.document_text || '',\n      document_summary: email.document_summary || '',\n      parsed_attachments: Array.isArray(email.parsed_attachments) ? email.parsed_attachments : [],\n      document_parse_error: email.document_parse_error || '',\n      information_extract_status: email.information_extract_status || '',\n      extracted_student_info: email.extracted_student_info || {},\n      extracted_request_info: email.extracted_request_info || {},\n      information_extract_error: email.information_extract_error || '',\n      status: classification.status,\n      is_faq: classification.is_faq === true,\n      department_id: classification.department_id || '',\n      department_name: classification.department_name || '',\n      department_email: classification.department_email || '',\n      confidence: Number.isFinite(Number(classification.confidence)) ? Number(classification.confidence) : 0,\n      reason: classification.reason || '',\n      auto_reply: classification.auto_reply === true,\n      auto_reply_allowed: classification.auto_reply_allowed === true,\n      route_to_department: classification.route_to_department === true,\n      core_action: classification.core_action || '',\n      manual_review: classification.manual_review === true,\n      draft_reply: classification.draft_reply || '',\n      routing_summary: classification.routing_summary || '',\n      delivery_status: classification.delivery_status || 'mock_output_only',\n      use_mock: email.use_mock === true,\n      no_actual_email_sent: true,\n      step: '11-6_solar_classification_mock_fallback'\n    },\n    binary: item.binary\n  };\n});"
+      },
+      "id": "f3e907aa-c3c3-4c50-9063-eb2bc566294a",
+      "name": "Normalize Final Output Function Node",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        -8672,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ $json }}",
+        "options": {}
+      },
+      "id": "0991fd5c-955f-4a7f-a85d-2ae6a19c467d",
+      "name": "Final Output Node",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -8448,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.assigned_department_email || $json.department_email}}",
+        "subject": "=[Mailman 자동배정] {{$json.subject}}",
+        "emailType": "text",
+        "message": "=[Mailman 자동배정 메일]\n\n담당 부서: {{$json.assigned_department_name || $json.department_name}}\n배정 사유: {{$json.assignment_reason}}\nAI 요약: {{$json.mail_summary}}\n\n원문 발신자: {{$json.from_email}}\n원문 제목: {{$json.subject}}\n수신 시각: {{$json.received_at_kst}}\n\n원문 본문:\n{{$json.body}}\n\nPDF 텍스트 추출 결과:\n{{$json.document_text || ($json.department_delivery_payload && $json.department_delivery_payload.parsed_document_text) || '(PDF 텍스트 추출 결과 없음)'}}\n\nPDF 처리 상태:\n{{$json.document_parse_status || 'n/a'}}\n\n처리된 첨부파일 목록:\n{{ JSON.stringify($json.parsed_attachments || ($json.department_delivery_payload && $json.department_delivery_payload.parsed_attachments) || []) }}\n\n안내:\n이 메일은 Mailman Core가 자동 분류하여 담당 부서로 전달한 메일입니다.\n첨부파일 원본은 전달하지 않고, Document Parse로 추출한 텍스트만 포함합니다.\n부서 담당자는 다음 단계에서 학생에게 답변을 작성하게 됩니다.",
+        "options": {}
+      },
+      "id": "86db4508-3551-4f74-bc99-725367068f70",
+      "name": "Send Email to Assigned Department Node",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -5632,
+        480
+      ],
+      "webhookId": "c7c6bd44-003c-4301-983f-568147cfddb2",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "rQKaW2Tgkcnf3IyH",
+          "name": "Gmail OAuth2 API"
+        }
+      },
+      "notes": "Routes only department-assigned emails to the selected department address. No Gmail credential id is hardcoded; select the Gmail credential in n8n after import. This node does not implement department-to-student replies."
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA",
+          "mode": "list",
+          "cachedResultName": "hackerton",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "시트1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $json.message_id }}",
+            "from_email": "={{ $json.from_email }}",
+            "subject": "={{ $json.subject }}",
+            "body": "={{ $json.body }}",
+            "received_at_kst": "={{ $json.received_at_kst }}",
+            "core_action": "={{ $json.core_action }}",
+            "assigned_department_id": "={{ $json.assigned_department_id }}",
+            "assigned_department_name": "={{ $json.assigned_department_name }}",
+            "confidence": "={{ $json.confidence }}",
+            "assignment_status": "={{ $json.assignment_status }}",
+            "mail_summary": "={{ $json.mail_summary }}",
+            "assignment_reason": "={{ $json.assignment_reason }}",
+            "auto_ack_sent": "={{ $json.auto_ack_sent }}",
+            "auto_ack_body": "={{ $json.auto_ack_body }}",
+            "no_actual_email_sent": "={{ $json.no_actual_email_sent }}",
+            "department_delivery_ready": "={{ $json.department_delivery_ready }}",
+            "student_reply_sent": "={{ $json.student_reply_sent }}",
+            "student_reply_body": "={{ $json.student_reply_body }}"
+          },
+          "matchingColumns": [
+            "message_id"
+          ],
+          "schema": [
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "body",
+              "displayName": "body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "received_at_kst",
+              "displayName": "received_at_kst",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "core_action",
+              "displayName": "core_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assigned_department_id",
+              "displayName": "assigned_department_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assigned_department_name",
+              "displayName": "assigned_department_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assignment_status",
+              "displayName": "assignment_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mail_summary",
+              "displayName": "mail_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assignment_reason",
+              "displayName": "assignment_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "auto_ack_sent",
+              "displayName": "auto_ack_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "auto_ack_body",
+              "displayName": "auto_ack_body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "no_actual_email_sent",
+              "displayName": "no_actual_email_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "department_delivery_ready",
+              "displayName": "department_delivery_ready",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "student_reply_sent",
+              "displayName": "student_reply_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "student_reply_body",
+              "displayName": "student_reply_body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -5632,
+        80
+      ],
+      "id": "8284cf98-c89e-49cc-89e0-bfacda40dfd2",
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TcrKKLLckiDhL0Ep",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA",
+          "mode": "list",
+          "cachedResultName": "hackerton",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "시트1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1pjQep7HFR1SdG3KEnMIanQofnCoVm6xUtMqY8-OVscA/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $json.message_id }}",
+            "from_email": "={{ $json.from_email }}",
+            "subject": "={{ $json.subject }}",
+            "body": "={{ $json.body }}",
+            "received_at_kst": "={{ $json.received_at_kst }}",
+            "core_action": "={{ $json.core_action }}",
+            "assigned_department_id": "={{ $json.assigned_department_id }}",
+            "assigned_department_name": "={{ $json.assigned_department_name }}",
+            "confidence": "={{ $json.confidence }}",
+            "assignment_status": "={{ $json.assignment_status }}",
+            "mail_summary": "={{ $json.mail_summary }}",
+            "assignment_reason": "={{ $json.assignment_reason }}",
+            "auto_ack_sent": "={{ $json.auto_ack_sent }}",
+            "auto_ack_body": "={{ $json.auto_ack_body }}",
+            "no_actual_email_sent": "={{ $json.no_actual_email_sent }}",
+            "department_delivery_ready": "={{ $json.department_delivery_ready }}",
+            "student_reply_sent": "={{ $json.student_reply_sent }}",
+            "student_reply_body": "={{ $json.student_reply_body }}"
+          },
+          "matchingColumns": [
+            "message_id"
+          ],
+          "schema": [
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "from_email",
+              "displayName": "from_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "body",
+              "displayName": "body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "received_at_kst",
+              "displayName": "received_at_kst",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "core_action",
+              "displayName": "core_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assigned_department_id",
+              "displayName": "assigned_department_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assigned_department_name",
+              "displayName": "assigned_department_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assignment_status",
+              "displayName": "assignment_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mail_summary",
+              "displayName": "mail_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assignment_reason",
+              "displayName": "assignment_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "auto_ack_sent",
+              "displayName": "auto_ack_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "auto_ack_body",
+              "displayName": "auto_ack_body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "no_actual_email_sent",
+              "displayName": "no_actual_email_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "department_delivery_ready",
+              "displayName": "department_delivery_ready",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "student_reply_sent",
+              "displayName": "student_reply_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "student_reply_body",
+              "displayName": "student_reply_body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -5632,
+        288
+      ],
+      "id": "741c5110-fd2b-448d-8241-9ad1f6894858",
+      "name": "Append or update row in sheet1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TcrKKLLckiDhL0Ep",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.from_email }}",
+        "subject": "=[Mailman 자동응답] {{$json.subject}}",
+        "emailType": "text",
+        "message": "={{ $json.auto_ack_body }}",
+        "options": {}
+      },
+      "id": "77f343fc-0e4a-427e-95a5-970db9b7e6d9",
+      "name": "Send Auto Reply to Student Gmail Node",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -5632,
+        -112
+      ],
+      "webhookId": "e4b4c88c-7bea-4dbd-a973-a7c08e48db09",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "rQKaW2Tgkcnf3IyH",
+          "name": "Gmail OAuth2 API"
+        }
+      },
+      "notes": "Sends Core auto replies to the original student sender. Select Gmail credential in n8n after import."
+    },
+    {
+      "parameters": {
+        "jsCode": "const source = $('Auto Reply Candidate Output Node').first().json;\nreturn [{ json: source }];"
+      },
+      "id": "23b08bb0-51ab-44fa-85a7-ade7ee7e7faa",
+      "name": "Restore Auto Reply Sheet Row Node",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5424,
+        -112
+      ],
+      "notes": "Restores the auto-reply output fields after Gmail Send so the sheet row stores the original Mailman payload."
+    }
+  ],
+  "connections": {
+    "Gmail Trigger Node": {
+      "main": [
+        [
+          {
+            "node": "Normalize Gmail Email Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Gmail Email Function Node": {
+      "main": [
+        [
+          {
+            "node": "Demo Config Set Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demo Config Set Node": {
+      "main": [
+        [
+          {
+            "node": "Check USE_MOCK Mode IF Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check USE_MOCK Mode IF Node": {
+      "main": [
+        [
+          {
+            "node": "Mock Classification Response Node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Attachment Exists IF Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Attachment Exists IF Node": {
+      "main": [
+        [
+          {
+            "node": "Prepare Document Parse Input Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Document Parse Fallback Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Document Parse Input Function Node": {
+      "main": [
+        [
+          {
+            "node": "Upstage Document Parse HTTP Request Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upstage Document Parse HTTP Request Node": {
+      "main": [
+        [
+          {
+            "node": "Normalize Document Parse Result Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Document Parse Result Function Node": {
+      "main": [
+        [
+          {
+            "node": "Prepare Information Extract Input Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Document Parse Fallback Function Node": {
+      "main": [
+        [
+          {
+            "node": "Prepare Information Extract Input Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Information Extract Input Function Node": {
+      "main": [
+        [
+          {
+            "node": "Upstage Information Extract HTTP Request Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upstage Information Extract HTTP Request Node": {
+      "main": [
+        [
+          {
+            "node": "Normalize Information Extract Result Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Information Extract Result Function Node": {
+      "main": [
+        [
+          {
+            "node": "Information Extract Fallback Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Information Extract Fallback Function Node": {
+      "main": [
+        [
+          {
+            "node": "Prepare Solar Classification Input Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Solar Classification Input Function Node": {
+      "main": [
+        [
+          {
+            "node": "Solar LLM Classification HTTP Request Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Solar LLM Classification HTTP Request Node": {
+      "main": [
+        [
+          {
+            "node": "Normalize Solar Classification Result Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Solar Classification Result Function Node": {
+      "main": [
+        [
+          {
+            "node": "Validate Classification Output Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Classification Output Function Node": {
+      "main": [
+        [
+          {
+            "node": "Route Core Action IF/Switch Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Core Action IF/Switch Node": {
+      "main": [
+        [
+          {
+            "node": "Auto Reply Candidate Output Node",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Department Assigned Inbox Output Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock Classification Response Node": {
+      "main": [
+        [
+          {
+            "node": "Normalize Final Output Function Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Final Output Function Node": {
+      "main": [
+        [
+          {
+            "node": "Final Output Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Department Assigned Inbox Output Node": {
+      "main": [
+        [
+          {
+            "node": "Append or update row in sheet1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Email to Assigned Department Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto Reply Candidate Output Node": {
+      "main": [
+        [
+          {
+            "node": "Send Auto Reply to Student Gmail Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto Reply to Student Gmail Node": {
+      "main": [
+        [
+          {
+            "node": "Restore Auto Reply Sheet Row Node",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Auto Reply Sheet Row Node": {
+      "main": [
+        [
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "staticData": {
+    "node:Gmail Trigger Node": {
+      "Gmail Trigger Node": {
+        "lastTimeChecked": 1781064101,
+        "possibleDuplicates": [
+          "19eafb16d0e83ce2",
+          "19eaebce15307033"
+        ]
+      }
+    }
+  },
+  "pinData": {},
+  "triggerCount": 1,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
